@@ -551,6 +551,71 @@ test('在线 AI 识别：填了 Key 就能把返回的文字填进来（接口�
   await ctx.close();
 });
 
+test('本站免费识别：服务端开通时，不填 Key 也能识别，而且首页直说"免登录"', needs, async () => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errors = watchErrors(page);
+
+  // 扮演"后端服务"：盖章 + 两个接口。注意盖章必须在页面脚本之前完成，
+  // 因为前端是"看到章才去探 /api/health"。
+  await ctx.addInitScript(() => {
+    window.__SCANFREE_SERVER__ = { api: true };
+  });
+
+  let ocrCalls = 0;
+  let ocrBody = null;
+  await page.route(`${BASE}/api/health`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, version: '1.0.0', ai: { enabled: true, free: true, model: 'deepseek-flash', reason: '', limits: { perHour: 30, perDay: 200 } } }),
+    })
+  );
+  await page.route(`${BASE}/api/ocr`, (route) => {
+    ocrCalls += 1;
+    ocrBody = JSON.parse(route.request().postData() || '{}');
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ text: '房屋租赁合同\n\n第一条 甲方将房屋出租给乙方使用。', model: 'deepseek-flash' }),
+    });
+  });
+  // 直连 DeepSeek 的路直接掐断：这一条要是被走了，说明"本站免费"没生效
+  await page.route('https://api.deepseek.com/**', (route) => route.abort());
+
+  await page.goto(`${BASE}/index.html`, { waitUntil: 'networkidle' });
+  await page.waitForFunction(() => /免登录/.test(document.querySelector('.topbar__sub')?.textContent || ''), { timeout: 10000 });
+
+  // 1) 首页文案必须诚实：后端在，就说"免登录"并点明"只有你主动点在线识别才会上传"
+  const sub = await page.$eval('.topbar__sub', (el) => el.textContent);
+  assert.match(sub, /免登录/);
+  assert.doesNotMatch(sub, /不上传/, '有后端时不能再说"不上传"，那是假话');
+  const hero = await page.$eval('.hero p', (el) => el.textContent);
+  assert.match(hero, /只有你主动点/);
+
+  // 2) 不填任何 Key，进识别页就该是在线（本站掏钱），并且界面上标明"本站免费"
+  await page.setInputFiles('#file-input', { name: 'photo.jpg', mimeType: 'image/jpeg', buffer: photo });
+  await waitForFullPreview(page);
+  await page.click('[data-act="ocr"]');
+  await page.waitForSelector('#ocr-text', { timeout: 10000 });
+  const state1 = await page.$eval('input[name="engine"][value="online"]', (el) => ({ checked: el.checked, disabled: el.disabled }));
+  assert.ok(state1.checked, '本站开通免费识别时，不填 Key 也应当默认选中"在线 AI"');
+  assert.ok(!state1.disabled, '不能被禁用');
+  assert.ok(await page.$('.engine__free'), '要在界面上标出"本站免费"，让用户知道不用自己掏钱');
+  const note = await page.$eval('.ocr__note', (el) => el.textContent);
+  assert.match(note, /本站|服务器/, '要说清楚图片会经过本站服务器');
+
+  // 3) 点一下才上传（绝不自动），结果落进文本框
+  assert.equal(ocrCalls, 0, '进页面不许自动上传');
+  await page.click('[data-act="run"]');
+  await page.waitForFunction(() => document.querySelector('#ocr-text')?.value?.includes('房屋租赁合同'), { timeout: 20000 });
+  assert.equal(ocrCalls, 1, '应当调用本站 /api/ocr，且只调一次');
+  assert.ok(String(ocrBody?.image || '').startsWith('data:image/jpeg;base64,'), '发给本站的图应当是 base64 data URL');
+
+  assert.deepEqual(errors, [], '整个流程不该有任何报错');
+  await ctx.close();
+});
+
 test('在线识别失败时：提示是人话，而且不丢掉已经识别出来的文字', needs, async () => {  const ctx = await browser.newContext();
   const page = await ctx.newPage();
   await page.route('https://api.deepseek.com/**', (route) =>

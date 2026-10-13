@@ -16,7 +16,7 @@
  * cache-first 会老老实实一直发旧的。
  */
 
-const CACHE_VERSION = 'scanfree-v1';
+const CACHE_VERSION = 'scanfree-v2';
 
 // 应用外壳：这些文件必须一次性全部缓存成功，否则离线打开会缺胳膊少腿
 const SHELL = [
@@ -72,6 +72,11 @@ self.addEventListener('fetch', (e) => {
 
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return; // 跨域（OCR 的 CDN 等）不插手
+
+  // 后端接口一律不碰：/api/health 探的是"本站现在有没有开通免费识别"，
+  // 要是被 cache-first 存下来，用户装过一次之后就永远看到旧答案，服务端
+  // 改了配置也不会变（而且 /api/ocr 那种带图带字的响应更不该进缓存）。
+  if (url.pathname.startsWith('/api/')) return;
 
   // 页面导航：先网络，失败再回缓存的首页
   if (req.mode === 'navigate') {

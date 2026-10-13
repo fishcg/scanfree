@@ -733,6 +733,18 @@ select {
 .ocr__row--engine .btn {
   flex: 0 0 auto;
 }
+.engine__free {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--brand-2);
+  color: #fff;
+  font-size: 11px;
+  font-style: normal;
+  vertical-align: 1px;
+}
+
 .engine {
   display: inline-flex;
   align-items: center;

@@ -268,11 +268,16 @@ function canUseServer() {
 
 /**
  * 探一次本站服务端。
- * 探到就返回 ai 信息（模型名、限流额度），探不到返回 null——调用方据此把"本站免费"
- * 显示或藏起来，而不是摆一个点了会报错的按钮。
+ * 探到返回 caps：`{ serverAi: true, free, model, limits, version }`（正好能直接喂给
+ * pickEngine/onlineTarget）；探不到返回 null——调用方据此把"本站免费"显示或藏起来，
+ * 而不是摆一个点了会报错的按钮。
  */
 export async function probeServer(opts = {}) {
   if (!canUseServer()) return null;
+  // 只有后端服务时才探：纯静态托管（GitHub Pages、start.sh 的 python 服务器）
+  // 上没有 /api/health，探一次就是一条 404 记录在控制台里。
+  // 标记由 server/server.js 在 index.html 的 </head> 前注入。
+  if (!opts.force && !globalThis.__SCANFREE_SERVER__) return null;
   const doFetch = opts.fetchImpl || globalThis.fetch;
   if (typeof doFetch !== 'function') return null;
   const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
@@ -286,7 +291,17 @@ export async function probeServer(opts = {}) {
     if (!res.ok) return null;
     const json = await res.json();
     // 服务端在，但没配 Key —— 对用户来说等于没有，如实返回 null
-    return json?.ai?.enabled ? { ...json.ai, version: json.version || '' } : null;
+    if (!json?.ai?.enabled) return null;
+    // 返回的形状必须与 pickEngine/onlineTarget 约定的 caps 一致（serverAi），
+    // 不能把服务端原始 ai 字段（enabled）直接丢出去：那样 pickEngine 读 caps.serverAi
+    // 永远是 undefined，能力探测等于白探——这个坑真踩过一次。
+    return {
+      serverAi: true,
+      free: json.ai.free !== false,
+      model: json.ai.model || DEFAULT_MODEL,
+      limits: json.ai.limits || null,
+      version: json.version || '',
+    };
   } catch {
     return null; // 探测失败不是错误，只是没有这个能力，不打扰用户
   } finally {

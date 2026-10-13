@@ -37,7 +37,7 @@ import { CropEditor, detectDocument, detectDocumentQuad, rectToQuad, quadToRect,
 import { buildPDF, buildTextPDF } from './pdf.js';
 import { buildZip } from './zip.js';
 import { recognize, OCR_LANGS, terminate as ocrTerminate } from './ocr.js';
-import { recognizeOnline, pickEngine, hasKey, testKey, AI_MODELS, DEFAULT_MODEL } from './ai.js';
+import { recognizeOnline, recognizeViaServer, onlineTarget, probeServer, hasKey, testKey, AI_MODELS, DEFAULT_MODEL } from './ai.js';
 import { CameraView, describeCameraError } from './camera.js';
 
 /* ================================================================== */
@@ -52,6 +52,9 @@ const state = {
   index: 0,
   settings: getSettings(),
   busy: false,
+  // 本站服务端的能力（有没有开通免费在线识别）。启动时探一次；探不到就等于
+  // "没有这个能力"，相关 UI 自动缺席，而不是摆一个点了会报错的按钮。
+  caps: { serverAi: false, model: '', limits: null },
 };
 
 const appEl = $('#app');
@@ -247,9 +250,12 @@ function render() {
 
 function renderHome() {
   topbarEl.classList.add('topbar--brand');
+  // 首页这句"不上传"是承诺，必须与真实行为一致：本站开通了在线识别之后，
+  // 用户点「在线识别」时那一页图片确实会离开设备，所以这里就改说"免登录"，
+  // 把上传的边界交给识别页去写清楚——不能一边留着"不上传"一边能上传。
   topbarEl.innerHTML = `
     <div class="topbar__inner">
-      <div class="topbar__title">全民扫描<span class="topbar__sub">免费 · 无广告 · 不上传</span></div>
+      <div class="topbar__title">全民扫描<span class="topbar__sub">${state.caps.serverAi ? '免费 · 无广告 · 免登录' : '免费 · 无广告 · 不上传'}</span></div>
       <button class="iconbtn" data-act="settings" title="设置">${icon('sliders')}</button>
     </div>`;
 
@@ -267,7 +273,11 @@ function renderHome() {
   viewEl.innerHTML = `
     <div class="hero">
       <h2>把手机变成扫描仪</h2>
-      <p>拍照自动去阴影、自动裁边，一键导出 PDF 和文字。<br/>所有处理都在你的手机上完成，不上传任何一张图片。</p>
+      <p>拍照自动去阴影、自动裁边，一键导出 PDF 和文字。<br/>${
+        state.caps.serverAi
+          ? '扫描、裁边、增强、导出都在你的手机上完成；只有你主动点「在线识别」时，那一页图片才会发去转成文字。'
+          : '所有处理都在你的手机上完成，不上传任何一张图片。'
+      }</p>
       <div class="hero__actions">
         <button class="btn btn--solid" data-act="shoot">${icon('camera', 20)} 拍照扫描</button>
         <button class="btn" data-act="import">${icon('image', 20)} 导入图片</button>
@@ -962,7 +972,11 @@ let ocrText = '';
 async function openOcr() {
   const page = state.doc.pages[state.index];
   const saved = state.settings.ocrLang || 'chi_sim+eng';
-  const online = pickEngine(state.settings) === 'online';
+  // 在线这条路有两个入口：本站服务端（免费、不用 Key）和用户自己的 Key。
+  // 前者优先——用户什么都不用配就能用上，这才是"免费给人民用"。
+  const target = onlineTarget(state.settings, state.caps);
+  const online = target !== null;
+  const viaServer = target === 'server';
   viewEl.classList.add('view--flush');
   topbarEl.innerHTML = `
     <div class="topbar__inner">
@@ -984,8 +998,8 @@ async function openOcr() {
         <textarea class="ocr__text" id="ocr-text" placeholder="识别结果会出现在这里，可以直接编辑、复制或导出。">${escapeHtml(page.text || '')}</textarea>
         <div class="ocr__row ocr__row--engine">
           <label class="engine">
-            <input type="radio" name="engine" value="online" ${online ? 'checked' : ''} ${hasKey(state.settings) ? '' : 'disabled'} />
-            <span>在线 AI（DeepSeek）</span>
+            <input type="radio" name="engine" value="online" ${online ? 'checked' : ''} ${online ? '' : 'disabled'} />
+            <span>在线 AI（DeepSeek）${viaServer ? '<em class="engine__free">本站免费</em>' : ''}</span>
           </label>
           <label class="engine">
             <input type="radio" name="engine" value="local" ${online ? '' : 'checked'} />
@@ -995,12 +1009,15 @@ async function openOcr() {
           <button class="btn btn--ghost" data-act="ai-settings" style="height:32px;padding:0 10px">${icon('sliders', 15)} 在线设置</button>
         </div>
         <div class="ocr__note">${
-          online
-            ? `<b>当前：在线 AI 识别。</b>这一页的图片会通过 HTTPS 上传到 DeepSeek 进行识别，并消耗你自己账号的额度（按 token 计费）。<br/>
-               图片只在这次请求里使用；不想上传就切回"本地离线"。`
-            : `当前：本地离线识别。第一次使用会下载语言模型（一次性，之后浏览器会缓存）。<br/>
-               <b>图片和识别过程都在你的设备上完成，不会上传到任何服务器。</b>
-               ${hasKey(state.settings) ? '' : '<br/>想在手机上手写/复杂版式认得更准？填一个自己的 DeepSeek Key 就能用在线识别。'}`
+          viaServer
+            ? `<b>当前：在线 AI 识别（本站已开通，不用自己填 Key）。</b>点「开始识别」后，这一页的图片会先传到本站服务器，再由服务器转给 DeepSeek 识别。<br/>
+               服务器不保存图片、不记录识别内容，每个 IP 每小时 30 次、每天 200 次；不想上传就切回"本地离线"。`
+            : online
+              ? `<b>当前：在线 AI 识别（用你自己的 Key）。</b>这一页的图片会通过 HTTPS 上传到 DeepSeek 进行识别，并消耗你自己账号的额度（按 token 计费）。<br/>
+                 图片只在这次请求里使用；不想上传就切回"本地离线"。`
+              : `当前：本地离线识别。第一次使用会下载语言模型（一次性，之后浏览器会缓存）。<br/>
+                 <b>图片和识别过程都在你的设备上完成，不会上传到任何服务器。</b>
+                 ${hasKey(state.settings) ? '' : '<br/>想在手机上手写/复杂版式认得更准？填一个自己的 DeepSeek Key 就能用在线识别。'}`
         }</div>
         <div class="ocr__row">
           <button class="btn btn--ghost" data-act="clear">清空</button>
@@ -1051,7 +1068,15 @@ async function openOcr() {
     el.onchange = () => {
       state.settings = setSettings({ ocrEngine: el.value });
       openOcr();
-      toast(el.value === 'online' ? '这次用在线 AI 识别，图片会上传' : '这次用本地离线识别', 'info', 3000);
+      toast(
+        el.value === 'online'
+          ? viaServer
+            ? '这次用在线 AI 识别（本站免费），图片会上传'
+            : '这次用在线 AI 识别，图片会上传'
+          : '这次用本地离线识别',
+        'info',
+        3000,
+      );
     };
   });
 
@@ -1062,12 +1087,13 @@ async function openOcr() {
 
   // 已有结果就不重复识别，省流量省时间
   if (page.text) return;
-  // 在线识别绝不自动开跑：进页面就偷偷把图片传出去、还花掉用户的额度，
-  // 这种事必须由用户点一下"开始识别"才发生。本地识别没有这个顾虑，照旧自动跑。
+  // 在线识别绝不自动开跑：不管是花用户的额度还是花站里的额度，进页面就偷偷
+  // 把图片传出去都不行，必须由用户点一下"开始识别"才发生。
+  // 本地识别没有这个顾虑，照旧自动跑。
   if (online) {
     const runBtn = $('[data-act="run"]');
     runBtn?.classList.add('btn--pulse');
-    toast('这页要用在线 AI 识别，点一下"开始识别"再上传', 'info', 4200);
+    toast(viaServer ? '点一下"开始识别"再上传（本站免费）' : '这页要用在线 AI 识别，点一下"开始识别"再上传', 'info', 4200);
     return;
   }
   runOcr(page, textEl, langEl.value, $('[data-act="run"]'));
@@ -1082,8 +1108,8 @@ async function leaveOcr(save) {
 async function runOcr(page, textEl, lang, btn) {
   if (btn) btn.disabled = true;
   showLoading('正在准备识别…', 0.02);
-  // 用哪个引擎：填了 Key（且没被强制成本地）就走 DeepSeek，否则本地 Tesseract
-  const engine = pickEngine(state.settings);
+  // 用哪个引擎：本站服务端（免费、不用 Key）> 用户自己的 Key > 本地 Tesseract
+  const target = onlineTarget(state.settings, state.caps);
   try {
     // 用增强后的图去识别，准确率明显高于原图
     const bmp = await getBitmap(page);
@@ -1098,7 +1124,12 @@ async function runOcr(page, textEl, lang, btn) {
 
     let text;
     let note;
-    if (engine === 'online') {
+    if (target === 'server') {
+      setProgress(0.15, '正在上传到本站服务器');
+      const r = await recognizeViaServer(canvas, { onProgress: (p, s) => setProgress(p, s) });
+      text = r.text;
+      note = `已用在线 AI 识别（${r.model}）`;
+    } else if (target === 'byok') {
       setProgress(0.15, '正在上传到 DeepSeek');
       const r = await recognizeOnline(canvas, {
         apiKey: state.settings.aiKey,
@@ -1124,7 +1155,7 @@ async function runOcr(page, textEl, lang, btn) {
     hideLoading();
     let msg = err?.message || '识别失败';
     // 在线失败时补一句退路：用户手上就有能用的本地方案，不该让他卡在这里
-    if (engine === 'online' && !/本地/.test(msg)) msg += '；也可以切到「本地离线」再试';
+    if (target && !/本地/.test(msg)) msg += '；也可以切到「本地离线」再试';
     toast(msg, 'error', 6000);
   } finally {
     if (btn) btn.disabled = false;
@@ -1476,11 +1507,18 @@ async function renderSettings() {
       </div>
 
       <div class="group">
-        <div class="group__title">在线 AI 识别（可选）</div>
+        <div class="group__title">在线 AI 识别${state.caps.serverAi ? '' : '（可选）'}</div>
+        ${
+          state.caps.serverAi
+            ? `<div class="row"><div class="row__label"><b>本站已开通在线识别，不用填 Key。</b><em>识别时那一页图片会经本站服务器转给 ${escapeHtml(state.caps.model || 'DeepSeek')}；
+               ${state.caps.limits ? `每 IP 每小时 ${state.caps.limits.perHour} 次、每天 ${state.caps.limits.perDay} 次` : '有频次限制'}。
+               下面这些是给"想用自己的 Key 直连"的人准备的，不填也完全能用。</em></div></div>`
+            : ''
+        }
         ${setRow(
           'ocrEngine',
           '识别引擎',
-          '自动 = 填了 Key 就用在线，没填就一直用本地离线',
+          state.caps.serverAi ? '自动 = 优先用本站免费的在线识别，需要时自动退回本地离线' : '自动 = 填了 Key 就用在线，没填就一直用本地离线',
           [
             { value: 'auto', label: '自动（推荐）' },
             { value: 'local', label: '只用本地离线' },
@@ -1598,6 +1636,16 @@ async function boot() {
 
   await refreshDocs();
   render();
+
+  // 先渲染再探服务端：探测慢（或超时 4s）也不能让用户对着白屏等。
+  // 探到了就重画一次首页，把"本站免费在线识别"这类文案换成真的。
+  probeServer()
+    .then((caps) => {
+      if (!caps) return;
+      state.caps = caps;
+      if (state.view === 'home') render();
+    })
+    .catch(() => {});
 
   window.addEventListener('beforeunload', () => {
     // 尽力保存（同步接口不可用，只能靠平时已经存过）

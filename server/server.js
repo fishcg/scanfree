@@ -134,7 +134,20 @@ async function serveStatic(req, res, urlPath) {
     'Cache-Control': hit.noStore ? 'no-store, must-revalidate' : 'public, max-age=600',
   };
   if (req.method === 'HEAD') return send(res, 200, '', headers);
-  return send(res, 200, await fsp.readFile(hit.file), headers);
+  const data = await fsp.readFile(hit.file);
+
+  // 给 index.html 塞一个"本站有后端"的标记。
+  //
+  // 为什么需要它：前端启动时要探一次 /api/health，才知道该说"不上传"还是
+  // "免登录"、以及要不要把"本站免费识别"露出来。可是没有后端的静态托管
+  // （GitHub Pages、start.sh 里那个 python 服务器）上，这个探测会稳定地打出一条
+  // 404 —— 用户看不见，但控制台脏了，而且我们自己的 e2e 用例"首页不许有任何报错"
+  // 会因此变红（真红过一次）。所以改成：后端自己在页面里盖章，前端看到章才去探。
+  if (ext === '.html') {
+    const html = data.toString('utf8').replace('</head>', '<script>window.__SCANFREE_SERVER__={api:true}</script></head>');
+    return send(res, 200, html, headers);
+  }
+  return send(res, 200, data, headers);
 }
 
 /* ------------------------------- 接口 ------------------------------- */
@@ -212,44 +225,78 @@ async function callDeepSeek({ imageDataUrl, prompt }) {
     prompt: prompt || undefined,
     maxTokens: config.deepseek.maxTokens,
   });
+  const payload = JSON.stringify(body);
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), config.deepseek.timeout);
-  let res;
-  try {
-    res = await fetch(`${config.deepseek.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.deepseek.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-  } catch (err) {
-    if (err?.name === 'AbortError') throw new HttpError(504, '识别超时了（服务器到 DeepSeek 这一跳太慢），请重试或改用本地离线识别');
-    throw new HttpError(502, '服务器连不上 DeepSeek，请稍后再试或改用本地离线识别');
-  } finally {
-    clearTimeout(timer);
-  }
+  // 为什么要重试：线上真出现过"第一次 502、同一条请求紧接着重发就成功"的情况
+  // （单次实测 23 秒后失败，随后同类请求 2.8 秒成功）。对用户来说，一次抖动
+  // 就是"识别失败"，而重试一次几乎不花额外成本。
+  //
+  // 为什么只重试一次、且只重试"值得重试的错"：
+  //   · 5xx / 网络错 / 超时 = 对面或链路抖了，重发有意义；
+  //   · 4xx（Key 不对、参数不对、被限流）= 重发还是同样结果，只会更慢更惹人烦。
+  //
+  // 为什么要总预算而不是"每次 120 秒、重试一次共 240 秒"：
+  // 前端 ai.js 的 TIMEOUT_MS 是 120 秒，服务端要是能跑 240 秒，用户会在 120 秒
+  // 看到"超时"，而服务端还在后台白烧一次调用的钱。所以总预算压在 110 秒以内，
+  // 并且留给重试的时间不足 5 秒就不重试了。
+  const deadline = Math.min(config.deepseek.timeout, 110000);
+  const startedAt = Date.now();
+  let lastErr = null;
 
-  if (!res.ok) {
-    let payload = '';
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const left = deadline - (Date.now() - startedAt);
+    if (left <= 5000) break;
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), left);
     try {
-      payload = JSON.parse(await res.text());
-    } catch {
-      /* 保留空 */
+      const res = await fetch(`${config.deepseek.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.deepseek.apiKey}`,
+        },
+        body: payload,
+        signal: ctrl.signal,
+      });
+
+      if (!res.ok) {
+        let payloadText = '';
+        try {
+          payloadText = JSON.parse(await res.text());
+        } catch {
+          /* 保留空 */
+        }
+        const err = new HttpError(res.status >= 500 ? 502 : res.status, describeUpstreamError(res.status, payloadText));
+        // 4xx 是"想清楚了的拒绝"，直接抛，不重试
+        if (res.status < 500) throw err;
+        lastErr = err;
+        console.warn(`[scanfree] DeepSeek 第 ${attempt} 次返回 ${res.status}，${attempt === 1 ? '准备重试' : '不再重试'}`);
+        continue;
+      }
+
+      let json;
+      try {
+        json = await res.json();
+      } catch {
+        lastErr = new HttpError(502, 'DeepSeek 返回了看不懂的内容，请重试');
+        continue;
+      }
+      return { text: extractText(json), model: body.model, usage: json.usage || null };
+    } catch (err) {
+      if (err instanceof HttpError) throw err; // 上面那个 4xx，别再包一层
+      if (err?.name === 'AbortError') {
+        lastErr = new HttpError(504, '识别超时了（服务器到 DeepSeek 这一跳太慢），请重试或改用本地离线识别');
+      } else {
+        lastErr = new HttpError(502, '服务器连不上 DeepSeek，请稍后再试或改用本地离线识别');
+      }
+      console.warn(`[scanfree] DeepSeek 第 ${attempt} 次请求失败：${err?.name || err?.message}，${attempt === 1 ? '准备重试' : '不再重试'}`);
+    } finally {
+      clearTimeout(timer);
     }
-    throw new HttpError(res.status >= 500 ? 502 : res.status, describeUpstreamError(res.status, payload));
   }
 
-  let json;
-  try {
-    json = await res.json();
-  } catch {
-    throw new HttpError(502, 'DeepSeek 返回了看不懂的内容，请重试');
-  }
-  return { text: extractText(json), model: body.model, usage: json.usage || null };
+  throw lastErr || new HttpError(502, '服务器连不上 DeepSeek，请稍后再试或改用本地离线识别');
 }
 
 async function handleOcr(req, res) {
