@@ -136,6 +136,86 @@ for (const [file, names] of exportsOf) {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 反向检查：有没有"用了但没 import"的名字
+ *
+ * 为什么需要：这个坑真实发生过——app.js 调了 looksStructured()，
+ * 但那行 import 里漏了它。模块照样加载成功（ESM 不会因为少 import 就报错），
+ * 只有等用户真的点"开始识别"、代码跑到那一行时才抛
+ * "looksStructured is not defined"，然后被 catch 成一句"识别失败"。
+ * 单元测试碰不到，因为那个函数在别的模块里测得好好的。
+ * ------------------------------------------------------------------ */
+const KEYWORDS = new Set([
+  'if', 'for', 'while', 'switch', 'catch', 'return', 'typeof', 'function', 'await', 'new',
+  'do', 'else', 'delete', 'void', 'yield', 'in', 'of', 'case', 'throw', 'super', 'import',
+  'async', 'constructor', 'get', 'set', 'static', 'class',
+]);
+const GLOBALS = new Set([
+  // 语言与内置对象
+  'Object', 'Array', 'String', 'Number', 'Boolean', 'Promise', 'Error', 'TypeError', 'RangeError',
+  'SyntaxError', 'Map', 'Set', 'WeakMap', 'WeakSet', 'RegExp', 'Date', 'Symbol', 'BigInt', 'JSON',
+  'Math', 'Reflect', 'Proxy', 'Iterator', 'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'Int8Array',
+  'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
+  'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'TextEncoder', 'TextDecoder',
+  'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURIComponent', 'decodeURIComponent',
+  'encodeURI', 'decodeURI', 'escape', 'unescape', 'fetch', 'queueMicrotask', 'structuredClone',
+  'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'requestAnimationFrame',
+  'cancelAnimationFrame', 'requestIdleCallback', 'btoa', 'atob', 'alert', 'confirm', 'prompt',
+  'createImageBitmap', 'AbortController', 'AbortSignal', 'Blob', 'File', 'FileReader', 'FormData',
+  'Headers', 'Request', 'Response', 'URL', 'URLSearchParams', 'Worker', 'Event', 'CustomEvent',
+  'DOMException', 'Notification', 'IntersectionObserver', 'ResizeObserver', 'MutationObserver',
+  'getComputedStyle', 'matchMedia', 'Audio', 'Image', 'Path2D', 'OffscreenCanvas', 'DOMMatrix',
+  'BroadcastChannel', 'MessageChannel', 'crypto', 'performance', 'console', 'document', 'window',
+  'navigator', 'location', 'history', 'localStorage', 'sessionStorage', 'indexedDB', 'IDBKeyRange',
+  'caches', 'self', 'globalThis', 'screen', 'frames', 'parent', 'top', 'open', 'close', 'focus',
+  'blur', 'scrollTo', 'scrollBy', 'addEventListener', 'removeEventListener', 'dispatchEvent',
+  'postMessage', 'importScripts', 'Tesseract', 'ImageData', 'CanvasRenderingContext2D',
+]);
+
+/** 这个模块里"合法存在"的名字：import 进来的 + 自己声明的 + 全局 */
+function knownNames(code) {
+  const known = new Set();
+  for (const i of importsOf(code)) for (const n of i.names) known.add(String(n).split(' as ').pop().trim());
+  for (const m of code.matchAll(/^\s*import\s+([A-Za-z_$][\w$]*)\s*(?:,|from)/gm)) known.add(m[1]);
+  for (const m of code.matchAll(/(?:^|[\s;{(,])(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g)) known.add(m[1]);
+  for (const m of code.matchAll(/(?:^|[\s;{(,])(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) known.add(m[1]);
+  for (const m of code.matchAll(/(?:^|[\s;{(,])(?:export\s+)?class\s+([A-Za-z_$][\w$]*)/g)) known.add(m[1]);
+  for (const m of code.matchAll(/\bimport\s*\{([^}]*)\}/g)) {
+    for (const n of m[1].split(',')) known.add(n.split(' as ').pop().trim());
+  }
+  // 类方法 / 对象字面量里的方法：`  async foo(a) {`、`  get bar() {`、`  _bind() {`
+  for (const m of code.matchAll(/^[ \t]+(?:static\s+)?(?:async\s+)?(?:get\s+|set\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/gm)) known.add(m[1]);
+  // 函数参数（含箭头函数的参数）——回调里的 resolve/reject 这类名字就是从这里来的
+  for (const m of code.matchAll(/\(([^()]*)\)\s*(?:=>|\{)/g)) {
+    for (const raw of m[1].split(',')) {
+      const n = raw.trim().split(/[\s=:{[]/)[0];
+      if (/^[A-Za-z_$][\w$]*$/.test(n)) known.add(n);
+    }
+  }
+  return known;
+}
+
+const undefinedCalls = [];
+for (const [file, code] of codes) {
+  const known = knownNames(code);
+  // 去掉字符串/注释，免得把文案里的词当成函数调用
+  const bare = code
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/[^\n]*/g, ' ')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/`(?:[^`\\]|\\.)*`/g, '``');
+  for (const m of bare.matchAll(/(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(/g)) {
+    const name = m[1];
+    if (known.has(name) || GLOBALS.has(name) || KEYWORDS.has(name)) continue;
+    undefinedCalls.push(`${file}:${bare.slice(0, m.index).split('\n').length} 调用了没见过的 ${name}()`);
+  }
+}
+const uniqUndefined = [...new Set(undefinedCalls)];
+if (uniqUndefined.length) {
+  for (const u of uniqUndefined) problems.push(`疑似"用了但没 import"：${u}`);
+}
+
 console.log(`检查了 ${files.length} 个模块、${checked} 处 import。`);
 if (problems.length) {
   console.error(`\n✖ 发现 ${problems.length} 个问题：`);

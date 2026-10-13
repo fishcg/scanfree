@@ -12,6 +12,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -62,8 +63,29 @@ function startUpstream() {
 /* ------------------------- 真的 scanfree 服务端 ------------------------- */
 
 /** 启一个服务端实例；env 覆盖掉默认配置 */
+/**
+ * 找一个大方能用的端口。
+ *
+ * 原先直接用 BASE_PORT + n，结果被本机一个残留的开发服务器占了同一个号，
+ * 服务端起不来、请求打到了别的进程上，测试报出来的是一句莫名其妙的
+ * "返回了 '□' 而不是中文"——排查花了很久。宁可多探一次。
+ */
+async function freePort() {
+  for (let i = 0; i < 60; i += 1) {
+    const port = BASE_PORT + startServer.n++;
+    const free = await new Promise((resolve) => {
+      const probe = net.createServer();
+      probe.once('error', () => resolve(false));
+      probe.once('listening', () => probe.close(() => resolve(true)));
+      probe.listen(port, '127.0.0.1');
+    });
+    if (free) return port;
+  }
+  throw new Error('找不到空闲端口');
+}
+
 async function startServer(env = {}) {
-  const port = BASE_PORT + startServer.n++;
+  const port = await freePort();
   const proc = spawn(process.execPath, [path.join(ROOT, 'server', 'server.js')], {
     cwd: ROOT,
     env: {

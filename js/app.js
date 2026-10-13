@@ -34,7 +34,9 @@ import { loadImage } from './render.js';
 import { saveDoc, loadDoc, listDocs, removeDoc, clearAll, usage, getSettings, setSettings, newId } from './store.js';
 import { buildScan, buildFilterPreviews, mergeToLongImage, FILTERS, rotateSource } from './pipeline.js';
 import { CropEditor, detectDocument, detectDocumentQuad, rectToQuad, quadToRect, warpPerspective } from './crop.js';
-import { buildPDF, buildTextPDF } from './pdf.js';
+import { buildPDF, buildTextPDF, buildMarkdownPDF } from './pdf.js';
+import { parseMarkdown, blocksToPlain, looksStructured, LAYOUT_PROMPT } from './markdown.js';
+import { buildDOCX } from './docx.js';
 import { buildZip } from './zip.js';
 import { recognize, OCR_LANGS, terminate as ocrTerminate } from './ocr.js';
 import { recognizeOnline, recognizeViaServer, onlineTarget, probeServer, hasKey, testKey, AI_MODELS, DEFAULT_MODEL } from './ai.js';
@@ -1021,19 +1023,41 @@ async function openOcr() {
         }</div>
         <div class="ocr__row">
           <button class="btn btn--ghost" data-act="clear">清空</button>
-          <button class="btn btn--ghost" data-act="txt">导出 TXT</button>
-          <button class="btn btn--primary" data-act="save">保存到文档</button>
+          <button class="btn btn--ghost" data-act="txt">导出…</button>
+          <button class="btn btn--primary" data-act="save" disabled>已保存</button>
         </div>
       </div>
     </div>`;
 
   const textEl = $('#ocr-text');
   const langEl = $('#ocr-lang');
+  textEl.addEventListener('input', () => markDirty(textEl.value.trim() !== (page.text || '')));
 
-  const save = async () => {
-    page.text = textEl.value.trim();
+  // "保存"这个按钮的意义：文本框里改了字（识别错的名字、多认出来的乱码），
+  // 想立刻把改动存进这一页。识别完、离开页面时都会自动存，所以按钮平时是灰的
+  // ——灰着才说明"没有未保存的改动"，而不是摆一个按了也不知道发生了什么的按钮。
+  const saveBtn = $('[data-act="save"]', viewEl);
+  const markDirty = (dirty) => {
+    if (!saveBtn) return;
+    saveBtn.disabled = !dirty;
+    saveBtn.textContent = dirty ? '保存修改' : '已保存';
+  };
+  const markClean = () => markDirty(false);
+
+  const save = async (quiet) => {
+    const next = textEl.value.trim();
+    if (next === (page.text || '')) {
+      if (!quiet) toast('没有改动', 'info');
+      return;
+    }
+    // 用户动过字就不再套用识别时的版式了：那份 Markdown 是改动前的内容，
+    // 拿它导出 Word 会把用户刚改的字丢掉——宁可降级成纯文字排版。
+    const hadLayout = Boolean(page.md);
+    page.text = next;
+    page.md = '';
     await persistDoc();
-    toast('已保存到这一页', 'success');
+    markClean();
+    if (!quiet) toast(hadLayout ? '已存进这一页（改过字后，导出按纯文字排版）' : '已把文字存进这一页', 'success', 3600);
   };
 
   $$('[data-act]', topbarEl).forEach((b) => {
@@ -1050,17 +1074,19 @@ async function openOcr() {
 
   $$('[data-act]', viewEl).forEach((b) => {
     const act = b.dataset.act;
-    if (act === 'run') b.onclick = () => runOcr(page, textEl, langEl.value, b);
-    if (act === 'clear') b.onclick = () => (textEl.value = '');
+    if (act === 'run') b.onclick = () => runOcr(page, textEl, langEl.value, b, markClean);
+    if (act === 'clear')
+      b.onclick = () => {
+        textEl.value = '';
+        markDirty(Boolean((page.text || '').trim()));
+      };
+    // 导出前先把文本框里的改动落盘，否则"看见的字"和"导出的字"会对不上
+    if (act === 'txt') b.onclick = async () => {
+      await save(true);
+      exportTextSheet();
+    };
     if (act === 'save') b.onclick = save;
     if (act === 'ai-settings') b.onclick = () => navigate({ view: 'settings' });
-    if (act === 'txt') {
-      b.onclick = () => {
-        const text = textEl.value.trim();
-        if (!text) return toast('还没有可导出的文字', 'warn');
-        download(text, `${safeName(state.doc.title)}_第${state.index + 1}页.txt`, 'text/plain;charset=utf-8');
-      };
-    }
   });
 
   // 切换引擎：只改这一次的偏好，立刻重画这一页的说明文字（说明必须与真实行为一致）
@@ -1105,7 +1131,7 @@ async function leaveOcr(save) {
   render();
 }
 
-async function runOcr(page, textEl, lang, btn) {
+async function runOcr(page, textEl, lang, btn, onSaved) {
   if (btn) btn.disabled = true;
   showLoading('正在准备识别…', 0.02);
   // 用哪个引擎：本站服务端（免费、不用 Key）> 用户自己的 Key > 本地 Tesseract
@@ -1124,24 +1150,37 @@ async function runOcr(page, textEl, lang, btn) {
 
     let text;
     let note;
+    let md = '';
     if (target === 'server') {
       setProgress(0.15, '正在上传到本站服务器');
       const r = await recognizeViaServer(canvas, { onProgress: (p, s) => setProgress(p, s) });
-      text = r.text;
+      md = r.text;
       note = `已用在线 AI 识别（${r.model}）`;
     } else if (target === 'byok') {
       setProgress(0.15, '正在上传到 DeepSeek');
       const r = await recognizeOnline(canvas, {
         apiKey: state.settings.aiKey,
         model: state.settings.aiModel || DEFAULT_MODEL,
+        prompt: LAYOUT_PROMPT,
         onProgress: (p, s) => setProgress(p, s),
       });
-      text = r.text;
+      md = r.text;
       note = `已用在线 AI 识别（${r.model}）`;
     } else {
       const r = await recognize(canvas, { lang, onProgress: (p, s) => setProgress(p, s) });
       text = r.text;
       note = `已用本地识别，置信度 ${Math.round(r.confidence)}%`;
+    }
+
+    // 在线识别拿到的是 Markdown：既留一份原文（导出 Word / 排版 PDF 时用），
+    // 也拆成纯文字（文本框里给用户看的、导出 TXT 用的都是它）。
+    // 认出来是手写、收据这种没有版式的东西时，Markdown 只是多余的壳，丢掉。
+    if (md) {
+      if (looksStructured(md)) text = blocksToPlain(parseMarkdown(md));
+      else {
+        text = md;
+        md = '';
+      }
     }
 
     hideLoading();
@@ -1150,7 +1189,13 @@ async function runOcr(page, textEl, lang, btn) {
       return;
     }
     textEl.value = text;
-    toast(note, 'success');
+    // 识别出来就立刻存进这一页。用户点的是"开始识别"，不是"识别完还要记得按保存"——
+    // 手机上一转身切个 App，结果就没了，那才是真的气人。
+    page.text = text.trim();
+    page.md = md.trim(); // 空字符串 = 没有版式信息
+    await persistDoc();
+    onSaved?.();
+    toast(`${note}，已存进这一页`, 'success');
   } catch (err) {
     hideLoading();
     let msg = err?.message || '识别失败';
@@ -1249,10 +1294,9 @@ async function exportSheet() {
     title: `导出 ${n} 页`,
     items: [
       { label: '导出为 PDF', value: 'pdf', icon: 'file', desc: '照片版，所见即所得，可打印、可发给别人' },
-      { label: '导出文字版 PDF', value: 'textpdf', icon: 'text', desc: '识别过的字变成能选中、能搜索的 PDF' },
       { label: '导出为长图', value: 'long', icon: 'image', desc: '一张竖长图，方便发微信' },
       { label: '导出 JPG 压缩包', value: 'zip', icon: 'zip', desc: `${n} 张原图，打包成 zip` },
-      { label: '导出文字 (TXT)', value: 'txt', icon: 'text', desc: '需要先做过文字识别' },
+      { label: '导出文字 / Word', value: 'textmenu', icon: 'text', desc: 'Word、排版 PDF、纯文字 PDF、TXT' },
       { label: '分享…', value: 'share', icon: 'share', desc: '用系统面板发给别人' },
     ],
   });
@@ -1260,8 +1304,7 @@ async function exportSheet() {
   if (act === 'pdf') return exportPdf();
   if (act === 'long') return exportLongImage();
   if (act === 'zip') return exportZip();
-  if (act === 'txt') return exportText();
-  if (act === 'textpdf') return exportTextPdf();
+  if (act === 'textmenu') return exportTextSheet();
   if (act === 'share') return sharePdf();
 }
 
@@ -1348,6 +1391,106 @@ async function exportZip() {
  * 第三份导出（TXT / 文字版 PDF）都要用它，所以顺手把"哪几页还没识别"也算出来，
  * 好让提示说清楚——用户看到"已导出"却发现少了两页，那是最糟的体验。
  */
+/**
+ * 有版式信息的页（= 在线识别过的页）。
+ * 本地识别只有一行行文字，没有标题/表格结构，不能假装有。
+ */
+function layoutParts() {
+  return state.doc.pages
+    .map((p, i) => ({ index: i + 1, md: (p.md || '').trim() }))
+    .filter((p) => p.md);
+}
+
+async function exportTextSheet() {
+  const pages = state.doc.pages;
+  const textPages = pages.filter((p) => (p.text || '').trim()).length;
+  const mdPages = layoutParts().length;
+  const act = await actionSheet({
+    title: '导出文字',
+    items: [
+      {
+        label: 'Word 文档（.docx）',
+        value: 'word',
+        icon: 'text',
+        desc: mdPages ? `标题、表格、加粗都保留，拿到手能接着改（${mdPages} 页）` : '要先用在线识别，本地识别没有版式',
+      },
+      {
+        label: '排版 PDF',
+        value: 'layoutpdf',
+        icon: 'file',
+        desc: mdPages ? '按原文档的标题和表格排，字能选中、能搜索' : '要先用在线识别，本地识别没有版式',
+      },
+      { label: '纯文字 PDF', value: 'textpdf', icon: 'file', desc: textPages ? '只要字，体积最小，适合归档' : '需要先识别一次' },
+      { label: 'TXT 纯文本', value: 'txt', icon: 'text', desc: textPages ? '给别的软件接着用' : '需要先识别一次' },
+    ],
+  });
+  if (!act) return;
+  if (act === 'word') return exportWord();
+  if (act === 'layoutpdf') return exportLayoutPdf();
+  if (act === 'textpdf') return exportTextPdf();
+  if (act === 'txt') return exportText();
+}
+
+/** 把有版式的页拼成一份 Markdown（\f 分页，和其他导出保持一页对一页） */
+function layoutMarkdown() {
+  return layoutParts()
+    .map((p) => p.md)
+    .join('\n\f\n');
+}
+
+/** Word：给"还要继续改这份文档"的人 */
+async function exportWord() {
+  const parts = layoutParts();
+  if (!parts.length) {
+    toast('还没有可排版的文字：在线识别一次才有版式（本地识别只有纯文字）', 'warn', 4000);
+    return;
+  }
+  showLoading('正在生成 Word…', 0.2);
+  try {
+    const bytes = await buildDOCX(parseMarkdown(layoutMarkdown()), { title: state.doc.title });
+    hideLoading();
+    const name = `${safeName(state.doc.title)}.docx`;
+    download(
+      new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
+      name
+    );
+    const missing = state.doc.pages.length - parts.length;
+    toast(
+      missing > 0 ? `已导出 Word（${formatBytes(bytes.length)}，有 ${missing} 页没版式，没放进去）` : `已导出 Word（${formatBytes(bytes.length)}）`,
+      'success',
+      4000
+    );
+  } catch (err) {
+    hideLoading();
+    console.error(err);
+    toast('导出 Word 失败：' + (err.message || '未知错误'), 'error', 5000);
+  }
+}
+
+/** 排版 PDF：给"要打印/要发给别人看"的人 */
+function exportLayoutPdf() {
+  const parts = layoutParts();
+  if (!parts.length) {
+    toast('还没有可排版的文字：在线识别一次才有版式（本地识别只有纯文字）', 'warn', 4000);
+    return;
+  }
+  try {
+    const bytes = buildMarkdownPDF(parseMarkdown(layoutMarkdown()), { title: state.doc.title, margin: 64 });
+    download(new Blob([bytes], { type: 'application/pdf' }), `${safeName(state.doc.title)}_排版.pdf`);
+    const missing = state.doc.pages.length - parts.length;
+    toast(
+      missing > 0
+        ? `已导出排版 PDF（有 ${missing} 页没版式，没放进去）`
+        : `已导出排版 PDF（${formatBytes(bytes.length)}）`,
+      'success',
+      4000
+    );
+  } catch (err) {
+    console.error(err);
+    toast('导出排版 PDF 失败：' + (err.message || '未知错误'), 'error', 5000);
+  }
+}
+
 function collectText() {
   const pages = state.doc.pages;
   const parts = [];

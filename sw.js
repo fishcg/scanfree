@@ -16,7 +16,7 @@
  * cache-first 会老老实实一直发旧的。
  */
 
-const CACHE_VERSION = 'scanfree-v2';
+const CACHE_VERSION = 'scanfree-v3';
 
 // 应用外壳：这些文件必须一次性全部缓存成功，否则离线打开会缺胳膊少腿
 const SHELL = [
@@ -31,6 +31,8 @@ const SHELL = [
   './js/pipeline.js',
   './js/crop.js',
   './js/detect.js',
+  './js/docx.js',
+  './js/markdown.js',
   './js/geometry.js',
   './js/pdf.js',
   './js/zip.js',

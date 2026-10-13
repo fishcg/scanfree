@@ -27,7 +27,7 @@ steps:
     commands:
       # 服务端零依赖，所以这里既不用 npm install，也不用联网。
       # 不含 e2e.test.mjs：那个要真浏览器，交给本地跑（CI 里没有 Chromium）
-      - node --test tests/filters.test.mjs tests/zip.test.mjs tests/pdf.test.mjs tests/textpdf.test.mjs tests/detect.test.mjs tests/ai.test.mjs tests/server.test.mjs tests/sw.test.mjs
+      - node --test tests/filters.test.mjs tests/zip.test.mjs tests/pdf.test.mjs tests/textpdf.test.mjs tests/layoutpdf.test.mjs tests/markdown.test.mjs tests/docx.test.mjs tests/detect.test.mjs tests/ai.test.mjs tests/server.test.mjs tests/sw.test.mjs
     when:
       event: [push, tag, pull_request]
 

@@ -325,8 +325,16 @@ function latStr(s) {
   return `(${out})`;
 }
 
-/** 一行文字 → PDF 绘制指令（按字体切成若干段，逐段定位） */
-function lineOps(line, x0, y, size) {
+/**
+ * 一行文字 → PDF 绘制指令（按字体切成若干段，逐段定位）。
+ *
+ * @param {{bold?: boolean, skew?: number}} [opts]
+ *   bold：STSong-Light 没有粗体，基础 14 字体里也没有中文粗体，所以用"描边+填充"
+ *         （Tr 2）假装粗体——同一段字先描一遍细边再填一遍。英文本来可以换
+ *         Helvetica-Bold，但那样同一个标题里的中英文粗细就不一致，反而更难看。
+ *   skew：斜体同样用文本矩阵切变假装（0.21 最像斜体）。
+ */
+function lineOps(line, x0, y, size, opts = {}) {
   const runs = [];
   let cur = null;
   for (const ch of line) {
@@ -338,14 +346,32 @@ function lineOps(line, x0, y, size) {
     }
     cur.text += ch;
   }
+  const skew = opts.skew ? opts.skew.toFixed(3) : '0';
   let s = '';
+  if (opts.bold) s += '2 Tr 0.36 w 0 g\n';
   let x = x0;
   for (const r of runs) {
     const payload = r.font === 'F2' ? cidHex(r.text) : latStr(r.text);
-    s += `BT /${r.font} ${size} Tf 1 0 0 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm ${payload} Tj ET\n`;
+    s += `BT /${r.font} ${size} Tf 1 0 ${skew} 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm ${payload} Tj ET\n`;
     x += measureText(r.text, size);
   }
+  if (opts.bold) s += '0 Tr\n';
   return s;
+}
+
+/** 把"行内片段数组"画成一行（每段按自己的样式画，x 依次推进），返回指令与行宽 */
+function runsOps(runs, x0, y, size, forceBold) {
+  let s = '';
+  let x = x0;
+  for (const r of runs || []) {
+    const t = r.text || '';
+    if (!t) continue;
+    const bold = Boolean(forceBold) || r.type === 'bold' || r.type === 'bolditalic';
+    const skew = r.type === 'italic' || r.type === 'bolditalic' ? 0.21 : 0;
+    s += lineOps(t, x, y, size, { bold, skew });
+    x += measureText(t, size);
+  }
+  return { ops: s, width: x - x0, text: (runs || []).map((r) => r.text || '').join('') };
 }
 
 /**
@@ -391,6 +417,34 @@ export function buildTextPDF(text, opts = {}) {
   }
 
   // 2. 写对象
+  return assemblePdf({
+    pw,
+    ph,
+    margin,
+    withNumbers,
+    title,
+    author,
+    pageCount: pageLines.length,
+    contentForPage: (i) => {
+      let content = '';
+      let y = ph - margin;
+      for (const line of pageLines[i]) {
+        if (line) content += lineOps(line, margin, y, size);
+        y -= lineHeight;
+      }
+      return content;
+    },
+  });
+}
+
+/**
+ * 把"每页的内容流"装配成完整的 PDF。
+ *
+ * 文字版 PDF 和排版版 PDF 只有"页面内容怎么来的"不一样，对象结构完全一样，
+ * 所以抽出来共用：对象号、xref 偏移、trailer 错一个，文件在任何阅读器里都打不开，
+ * 这种地方最不该有两份实现。
+ */
+function assemblePdf({ pw, ph, margin, withNumbers, title, author, pageCount, contentForPage }) {
   const chunks = [];
   let length = 0;
   const push = (u8) => {
@@ -398,7 +452,6 @@ export function buildTextPDF(text, opts = {}) {
     length += u8.length;
   };
 
-  const pageCount = pageLines.length;
   const firstPageObj = 7;
   const objCount = 6 + pageCount * 2 + 1;
   const offsets = new Array(objCount + 1).fill(0);
@@ -418,7 +471,7 @@ export function buildTextPDF(text, opts = {}) {
 
   // 2: Pages
   beginObj(2);
-  const kids = pageLines.map((_, i) => `${firstPageObj + i * 2} 0 R`).join(' ');
+  const kids = Array.from({ length: pageCount }, (_, i) => `${firstPageObj + i * 2} 0 R`).join(' ');
   push(str(`<< /Type /Pages /Kids [${kids}] /Count ${pageCount} >>\n`));
   endObj();
 
@@ -454,7 +507,7 @@ export function buildTextPDF(text, opts = {}) {
   endObj();
 
   // 页面
-  pageLines.forEach((pl, i) => {
+  for (let i = 0; i < pageCount; i += 1) {
     const pageNum = firstPageObj + i * 2;
     const contentNum = pageNum + 1;
 
@@ -468,12 +521,7 @@ export function buildTextPDF(text, opts = {}) {
     );
     endObj();
 
-    let content = '';
-    let y = ph - margin;
-    for (const line of pl) {
-      if (line) content += lineOps(line, margin, y, size);
-      y -= lineHeight;
-    }
+    let content = contentForPage(i);
     if (withNumbers) {
       content += `BT /F1 9 Tf 1 0 0 1 ${(pw / 2 - 18).toFixed(2)} ${(margin - 26).toFixed(2)} Tm (${i + 1} / ${pageCount}) Tj ET\n`;
     }
@@ -484,7 +532,7 @@ export function buildTextPDF(text, opts = {}) {
     push(str(content));
     push(str('endstream\n'));
     endObj();
-  });
+  }
 
   // 文档信息
   const infoNum = objCount;
@@ -512,4 +560,276 @@ export function buildTextPDF(text, opts = {}) {
     o += c.length;
   }
   return out;
+}
+
+/** 标题字号：一级最大，六级最小。数值按"打印在 A4 上"调，不是随便取的 */
+const HEADING_SIZE = [20.5, 16.5, 14.5, 13, 12, 11.5];
+const CELL_PAD = 5;
+
+/**
+ * 生成"保排版的文字版"PDF：标题层级、加粗、斜体、列表、表格都按结构画出来。
+ *
+ * 与 buildTextPDF 的区别：那个只认行，这个认结构。用户拍一份合同/通知，
+ * 想要的是"这份文档"，不是"一堆字"。
+ *
+ * @param {Array<object>} blocks js/markdown.js 的 parseMarkdown() 输出
+ * @param {{title?: string, size?: number, lineHeight?: number, margin?: number,
+ *          pageNumbers?: boolean, author?: string}} [opts]
+ * @returns {Uint8Array}
+ */
+export function buildMarkdownPDF(blocks, opts = {}) {
+  const list = Array.isArray(blocks) ? blocks : [];
+  if (!list.length) throw new Error('还没有可导出的内容');
+
+  const size = opts.size || 10.5;
+  const lineHeight = (opts.lineHeight || 1.72) * size;
+  const margin = opts.margin == null ? 64 : opts.margin;
+  const pw = A4.w;
+  const ph = A4.h;
+  const contentW = pw - margin * 2;
+  const withNumbers = opts.pageNumbers !== false;
+  const bottomY = margin + (withNumbers ? 14 : 0);
+
+  const pages = [];
+  let cur = '';
+  let y = ph - margin;
+
+  const newPage = () => {
+    pages.push(cur);
+    cur = '';
+    y = ph - margin;
+  };
+  /** 下面的内容还放得下吗？放不下就翻页（返回是否翻了页） */
+  const ensure = (h) => {
+    if (y - h < bottomY) {
+      newPage();
+      return true;
+    }
+    return false;
+  };
+
+  const hline = (x1, x2, yy, w = 0.6, gray = 0.62) =>
+    `${gray} ${gray} ${gray} RG ${w} w ${x1.toFixed(2)} ${yy.toFixed(2)} m ${x2.toFixed(2)} ${yy.toFixed(2)} l S\n`;
+  const vline = (xx, y1, y2, w = 0.6, gray = 0.62) =>
+    `${gray} ${gray} ${gray} RG ${w} w ${xx.toFixed(2)} ${y1.toFixed(2)} m ${xx.toFixed(2)} ${y2.toFixed(2)} l S\n`;
+
+  /** 一行行地画（行 = 行内片段数组），每行都比对一次剩余空间 */
+  const drawLines = (lineList, x, sz, bold) => {
+    const step = (lineHeight * sz) / size;
+    for (const ln of lineList) {
+      ensure(step);
+      y -= step;
+      const baseline = y + (step - sz) * 0.62;
+      cur += runsOps(ln, x, baseline, sz, bold).ops;
+    }
+  };
+
+  const renderTable = (b) => {
+    const cols = (b.header || b.rows[0] || []).length;
+    if (!cols) return;
+
+    // 列宽：按每列内容的自然宽度加权分，再夹到 [46pt, 45% 版心]，避免一列吃掉全部
+    const natural = [];
+    for (let c = 0; c < cols; c += 1) {
+      let m = measureText(inlineToPlainOf(b.header && b.header[c]), size);
+      for (const row of b.rows) m = Math.max(m, measureText(inlineToPlainOf(row[c]), size));
+      natural.push(Math.min(Math.max(m, 40), contentW * 0.45));
+    }
+    const natSum = natural.reduce((a, v) => a + v, 0) || 1;
+    const widths = natural.map((v) => (v / natSum) * contentW);
+
+    const wrapRow = (row) => row.map((cell, i) => wrapRuns(cell || [], Math.max(20, widths[i] - CELL_PAD * 2), size));
+    const rowHeight = (row) => {
+      const wrapped = wrapRow(row);
+      return Math.max(...wrapped.map((ls) => Math.max(1, ls.length))) * lineHeight + CELL_PAD * 1.5;
+    };
+    const drawRow = (row, isHeader) => {
+      const wrapped = wrapRow(row);
+      const h = rowHeight(row);
+      const top = y;
+      if (isHeader) cur += `0.94 g ${margin.toFixed(2)} ${(top - h).toFixed(2)} ${contentW.toFixed(2)} ${h.toFixed(2)} re f 0 g\n`;
+      let x = margin;
+      for (let i = 0; i < cols; i += 1) {
+        let ty = top - CELL_PAD * 0.85 - size;
+        for (const ln of wrapped[i] || []) {
+          cur += runsOps(ln, x + CELL_PAD, ty, size, isHeader).ops;
+          ty -= lineHeight;
+        }
+        x += widths[i];
+      }
+      cur += hline(margin, margin + contentW, top - h) + hline(margin, margin + contentW, top);
+      let vx = margin;
+      for (let i = 0; i < cols; i += 1) {
+        cur += vline(vx, top - h, top);
+        vx += widths[i];
+      }
+      cur += vline(margin + contentW, top - h, top);
+      y = top - h;
+    };
+
+    ensure(rowHeight(b.header || b.rows[0]) + 2);
+    if (b.header) drawRow(b.header, true);
+    for (const row of b.rows) {
+      if (y - rowHeight(row) < bottomY) {
+        newPage();
+        if (b.header) drawRow(b.header, true);
+      }
+      drawRow(row, false);
+    }
+    y -= 9;
+  };
+
+  for (const b of list) {
+    if (!b) continue;
+
+    if (b.type === 'heading') {
+      const lv = Math.min(6, Math.max(1, b.level || 1));
+      const hs = HEADING_SIZE[lv - 1];
+      if (y - hs * 1.4 < bottomY) newPage();
+      else y -= lv === 1 ? 2 : 12;
+      ensure(hs * 1.5);
+      y -= hs * 0.95;
+      cur += runsOps(b.inline, margin, y, hs, true).ops;
+      if (lv <= 2) {
+        y -= 5;
+        cur += hline(margin, margin + contentW, y, lv === 1 ? 1 : 0.6, 0.55);
+      }
+      y -= Math.max(7, hs * 0.42);
+      continue;
+    }
+
+    if (b.type === 'para') {
+      drawLines(wrapRuns(b.inline, contentW, size), margin, size);
+      y -= size * 0.62;
+      continue;
+    }
+
+    if (b.type === 'list') {
+      for (let i = 0; i < (b.items || []).length; i += 1) {
+        const it = b.items[i];
+        const indent = 18 + Math.min(3, it.level || 0) * 16;
+        const marker = b.ordered ? `${i + 1}.` : '·';
+        const lines = wrapRuns(it.inline, contentW - indent, size);
+        if (!lines.length) continue;
+        ensure(lineHeight);
+        y -= lineHeight;
+        const baseline = y + (lineHeight - size) * 0.62;
+        cur += lineOps(marker, margin + indent - 14, baseline, size, { bold: b.ordered });
+        for (let k = 0; k < lines.length; k += 1) {
+          if (k > 0) {
+            ensure(lineHeight);
+            y -= lineHeight;
+          }
+          const bl = y + (lineHeight - size) * 0.62;
+          cur += runsOps(lines[k], margin + indent, bl, size).ops;
+        }
+      }
+      y -= size * 0.5;
+      continue;
+    }
+
+    if (b.type === 'table') {
+      renderTable(b);
+      continue;
+    }
+
+    if (b.type === 'code') {
+      const lines = String(b.text || '')
+        .split('\n')
+        .flatMap((l) => wrapRuns([{ type: 'code', text: l || ' ' }], contentW - 20, size * 0.94));
+      const boxH = lines.length * lineHeight + 12;
+      ensure(Math.min(boxH, lineHeight * 3));
+      const top = y;
+      let ty = top;
+      for (const ln of lines) {
+        if (y - lineHeight < bottomY) {
+          // 代码块跨页：先把这一页的底色补上再翻页
+          cur += `0.96 g ${margin.toFixed(2)} ${(y - 6).toFixed(2)} ${contentW.toFixed(2)} ${(top - y + 6).toFixed(2)} re f 0 g\n`;
+          newPage();
+          ty = y;
+        }
+        ensure(lineHeight);
+        y -= lineHeight;
+        cur += runsOps(ln, margin + 10, y + (lineHeight - size * 0.94) * 0.62, size * 0.94).ops;
+      }
+      cur += `0.96 g ${margin.toFixed(2)} ${(y - 6).toFixed(2)} ${contentW.toFixed(2)} ${(ty - y + 6).toFixed(2)} re f 0 g\n`;
+      y -= 10;
+      continue;
+    }
+
+    if (b.type === 'pagebreak') {
+      // 多页扫描件：模型每页给一份 Markdown，拼起来时用 \f 分隔，
+      // 这里就真的翻一页，保证"一页对一页"
+      if (cur.trim()) newPage();
+      continue;
+    }
+
+    if (b.type === 'hr') {
+      ensure(12);
+      y -= 8;
+      cur += hline(margin, margin + contentW, y, 0.6, 0.7);
+      y -= 8;
+    }
+  }
+
+  pages.push(cur);
+
+  return assemblePdf({
+    pw,
+    ph,
+    margin,
+    withNumbers,
+    title: opts.title || '扫描件',
+    author: opts.author || '全民扫描 ScanFree',
+    pageCount: pages.length,
+    contentForPage: (i) => pages[i] || '',
+  });
+}
+
+/** 行内片段 → 纯文字（量宽度用；表格列宽不需要知道粗体斜体） */
+function inlineToPlainOf(inline) {
+  if (!Array.isArray(inline)) return '';
+  return inline.map((s) => s.text || '').join('');
+}
+
+/** 行内片段数组 → 按宽度折行；返回"行数组"，每行本身又是一个行内片段数组 */
+export function wrapRuns(inline, maxWidth, size) {
+  const lines = [];
+  let line = [];
+  let w = 0;
+  const flush = () => {
+    lines.push(line);
+    line = [];
+    w = 0;
+  };
+  const put = (type, text) => {
+    const last = line[line.length - 1];
+    if (last && last.type === type) last.text += text;
+    else line.push({ type, text });
+  };
+  for (const run of inline || []) {
+    // \n 是硬换行（parseMarkdown 保留原文档的行），不是可以随便合并的空白
+    const pieces = String(run.text || '').split('\n');
+    for (let pi = 0; pi < pieces.length; pi += 1) {
+      if (pi > 0) flush();
+      for (const tk of tokenize(pieces[pi])) {
+        const tw = measureText(tk, size);
+        if (w > 0 && w + tw > maxWidth && !(tk.length === 1 && NO_LINE_START.has(tk))) flush();
+        if (tw > maxWidth && [...tk].length > 1) {
+          // 一个 token 比整行还宽（超长英文单词/数字串）：硬切
+          for (const ch of tk) {
+            const cw = measureText(ch, size);
+            if (w + cw > maxWidth) flush();
+            put(run.type, ch);
+            w += cw;
+          }
+          continue;
+        }
+        put(run.type, tk);
+        w += tw;
+      }
+    }
+  }
+  if (line.length || !lines.length) flush();
+  return lines;
 }

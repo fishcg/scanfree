@@ -12,21 +12,23 @@
  *   - 服务端会把图片缩到约 1300×1300，所以传再大也没用，每张最多约 1024 token
  */
 
+import { LAYOUT_PROMPT } from '../../js/markdown.js';
+
 export const DEFAULT_MODEL = 'deepseek-flash';
 export const DEFAULT_BASE_URL = 'https://api.deepseek.com';
 
 /** 允许的图片类型（data URL 的 mime） */
 export const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
 
-/** 识别指令。目标是"可导出的纯文本"，所以明确禁止 Markdown 和客套话。 */
-export const OCR_PROMPT = `把这张图片里出现的文字逐字提取出来。
-
-规则：
-1. 只输出图片里真实存在的文字，不要解释、不要总结、不要翻译、不要补充看不清的内容。
-2. 保持原有的阅读顺序和换行，同一段就是一段，段落之间空一行。
-3. 看不清的字用 □ 代替；整行实在无法辨认就跳过这一行。
-4. 不要用代码块包裹，不要输出 Markdown 标记，不要写"以下是识别结果"之类的话。
-5. 遇到表格按行输出，同一行的单元格之间用 | 分隔。`;
+/**
+ * 识别指令。直接复用前端那份"保排版"提示词（js/markdown.js 的 LAYOUT_PROMPT）。
+ *
+ * 为什么要 Markdown：模型本来就能看出哪行是标题、哪几列是表格，只让它吐纯文字
+ * 等于把这份信息当场扔掉，用户事后想导出 Word 就再也补不回来。前端拿到 Markdown
+ * 后自己拆成纯文字（blocksToPlain）给文本框用，两边各取所需。
+ * 一份提示词两处维护，早晚有一天会跑偏，所以服务端 import 前端那份。
+ */
+export const OCR_PROMPT = LAYOUT_PROMPT;
 
 /** 带 HTTP 状态码的错误：服务端据此回状态码，而不是一律 500 */
 export class HttpError extends Error {
@@ -38,7 +40,7 @@ export class HttpError extends Error {
 }
 
 /** 拼一个 OpenAI 兼容的看图请求体 */
-export function buildVisionRequest({ imageDataUrl, model = DEFAULT_MODEL, prompt = OCR_PROMPT, maxTokens = 4096 }) {
+export function buildVisionRequest({ imageDataUrl, model = DEFAULT_MODEL, prompt = OCR_PROMPT, maxTokens = 8192 }) {
   if (!imageDataUrl || typeof imageDataUrl !== 'string') throw new HttpError(400, '缺少图片数据');
   return {
     model,

@@ -705,10 +705,10 @@ test('导出文字版 PDF：字能选中、能搜索，Ghostscript 解析得了'
   await page.waitForSelector('#ocr-text', { timeout: 10000 });
   await page.fill('#ocr-text', typed);
   await page.click('[data-act="save"]');
-  await page.click('[data-act="back"]');
-  await page.waitForSelector('#page-img', { timeout: 10000 });
 
-  await page.click('[data-act="share"]');
+  // 文字类的导出都收在识别页的「导出…」里（Word / 排版 PDF / 纯文字 PDF / TXT）——
+  // 它们是"从识别出来的字出发"的导出，和主菜单里"从照片出发"的 PDF/长图是两回事
+  await page.click('[data-act="txt"]');
   await page.waitForSelector('.sheet__item[data-value="textpdf"]', { timeout: 10000 });
   const [dl] = await Promise.all([
     page.waitForEvent('download', { timeout: 60000 }),
