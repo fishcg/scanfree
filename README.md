@@ -191,6 +191,14 @@ push → 跑单元测试（不过就不构建）→ 构建镜像推到内网 reg
 流水线定义在 `.woodpecker.yml`，三个坑都写在文件开头的注释里（关掉 partial
 clone、构建走代理但放行内网、用短 SHA 做 tag）。
 
+这条链路要跨两次国境（GitHub → 服务器拉代码 → 推镜像到内网 registry），所以
+**偶发失败是网络问题，不是代码问题**。真遇到过的两种，处理方式不一样：
+
+- 流水线在 `git` 步骤 `exit 128`：克隆超时。重跑一次通常就过。
+- GitHub 的 webhook 投递显示 502 `failed to connect to host`：**推送成功但流水线
+  根本没被创建**（GitHub 的 webhook 不会自动重投）。在 GitHub 仓库的
+  Settings → Webhooks → Recent Deliveries 里点 Redeliver 即可。
+
 ### 集群里的样子
 
 ```bash
