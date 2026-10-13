@@ -124,7 +124,7 @@
 node --test tests/*.test.mjs
 ```
 
-55 个测试，覆盖图像算法、PDF/ZIP 结构、Service Worker 预缓存清单、
+93 个测试，覆盖图像算法、服务端接口、PDF/ZIP 结构、Service Worker 预缓存清单、
 以及一个真浏览器端到端流程（启动本地服务 → 导入照片 → 切滤镜 → 导出 →
 重开页面确认数据还在 → 断网确认能打开）。
 
@@ -145,10 +145,61 @@ node tools/preview.mjs
 
 ---
 
+## 部署（在线版）
+
+线上实例：**https://scan.acgay.cn**
+
+同一份代码有两种跑法：
+
+- **本地版**：双击 `index.html`，或者 `./start.sh`。照片不出设备。
+- **在线版**：`npm start`，就是一个普通网站（`server/server.js`，零依赖，
+  只用 Node 内置模块）。在线版多提供一个 `/api/ocr`：由服务器拿着站里的
+  Key 去调 DeepSeek 看图，用户不用自己填 Key。前端会先问 `/api/health`
+  确认这台服务器到底支不支持在线识别，不支持就自动退回本地识别。
+
+`/api/ocr` 有三道闸门防着 Key 被刷：同 IP 每小时 30 次 / 每天 200 次，
+全站每天 3000 次（见 `k8s.yaml` 的 ConfigMap）。
+
+### 自动构建与上线
+
+推到 `main` 就走一遍 [Woodpecker CI](http://ci.acgay.cn)：
+
+```
+push → 跑单元测试（不过就不构建）→ 构建镜像推到内网 registry
+     → kubectl set image 滚动更新 → kubectl rollout status
+```
+
+镜像 tag 是**提交短 SHA**，所以回滚就是 `kubectl set image` 指回上一个 SHA。
+流水线定义在 `.woodpecker.yml`，三个坑都写在文件开头的注释里（关掉 partial
+clone、构建走代理但放行内网、用短 SHA 做 tag）。
+
+### 集群里的样子
+
+```bash
+kubectl apply -f k8s.yaml
+kubectl create secret generic scanfree-secret --from-literal=DEEPSEEK_API_KEY=sk-xxx
+```
+
+- `deployment/scanfree`：1 副本，监听 7994
+- `service/scanfree-service`：NodePort **30094**
+- `configmap/scanfree-cfg`：模型名、超时、限流阈值
+- `secret/scanfree-secret`：DeepSeek Key（**不放 ConfigMap**，那玩意儿
+  `kubectl get cm` 就能看到明文）
+
+域名在 k3s-worker（node1）上用 nginx 反代到 `127.0.0.1:30094`，
+证书走 certbot。
+
+---
+
 ## 目录
 
 ```
 index.html            应用外壳
+server/               在线版的服务端（零依赖 Node）
+  server.js           HTTP 服务：静态文件 + /api/health + /api/ocr
+  lib/ocr.js          调 DeepSeek 看图，图片转 base64、结果归一化
+  config.js           环境变量 → 配置（Key、模型、限流）
+  entrypoint.sh       容器入口（约定 args: ["start"]）
 manifest.webmanifest  PWA 信息（"添加到主屏幕"用）
 sw.js                 Service Worker：离线缓存
 start.sh              启动脚本（本机服务器）
@@ -167,10 +218,13 @@ js/
   pdf.js              手写 PDF 生成
   zip.js              手写 ZIP 生成
   ui.js               弹窗、提示、图标等界面零件
+  pdf.js 也能把识别出的文字排成 PDF（不是把照片贴进 PDF），导出菜单里的
+  「文字版 PDF」就是它
 tools/
   make-icons.mjs      用 Node 画应用图标（不依赖任何图形库）
   preview.mjs         跑一遍流程并截图
-tests/                74 个测试（含真浏览器端到端）
+  check-imports.mjs   检查 import/export 是否对得上
+tests/                93 个测试（含真浏览器端到端）
 ```
 
 ---
