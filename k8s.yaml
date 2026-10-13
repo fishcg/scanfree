@@ -1,0 +1,99 @@
+# 全民扫描（scanfree）—— k3s 部署清单
+#
+# 与 ai-image 同一套范式：NodePort Service + Deployment + ConfigMap 调参。
+# 一处刻意的不同：**DeepSeek 的 Key 放 Secret，不放 ConfigMap**。
+# ai-image 把 DashScope 的 Key 直接写在 ConfigMap 里（kubectl get cm 就能看到明文），
+# 那是历史包袱不该照抄——Key 单独放 Secret，ConfigMap 只放模型名和限流这类调参。
+#
+# 部署：
+#   kubectl apply -f k8s.yaml
+#   kubectl create secret generic scanfree-secret --from-literal=DEEPSEEK_API_KEY=sk-xxx   # 只需一次
+#   kubectl rollout restart deployment/scanfree      # 改了 secret 之后
+#
+# NodePort 选 30094：紧挨着 ai-image 的 30093，一眼能看出是同一族的服务。
+apiVersion: v1
+kind: Service
+metadata:
+  name: scanfree-service
+spec:
+  type: NodePort
+  ports:
+    - name: web
+      port: 7994
+      targetPort: 7994
+      nodePort: 30094
+  selector:
+    app: scanfree
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scanfree
+spec:
+  selector:
+    matchLabels:
+      app: scanfree
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: scanfree
+    spec:
+      containers:
+        - name: scanfree
+          # 初次 apply 用 latest；之后每次上线由 CI 改成提交短 SHA（回滚就是改回上一个 SHA）
+          image: 172.24.173.77:30500/scanfree:latest
+          imagePullPolicy: IfNotPresent
+          args: ["start"]
+          ports:
+            - containerPort: 7994
+          env:
+            - name: TZ
+              value: 'Asia/Shanghai'
+          # 调参来自 ConfigMap
+          envFrom:
+            - configMapRef:
+                name: scanfree-cfg
+            # Key 来自 Secret；optional 是故意的：没有 Key 也要能起来，
+            # 起来之后 /api/health 会如实说"本站没开通在线识别"，前端自动退回本地离线。
+            - secretRef:
+                name: scanfree-secret
+                optional: true
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 7994
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 7994
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: scanfree-cfg
+  labels:
+    app: scanfree
+data:
+  # 看图模型：deepseek-flash 是 DeepSeek 目前唯一支持图片输入的模型
+  DEEPSEEK_MODEL: 'deepseek-flash'
+  DEEPSEEK_BASE_URL: 'https://api.deepseek.com'
+  DEEPSEEK_TIMEOUT: '120000'
+  DEEPSEEK_MAX_TOKENS: '4096'
+  # 限流：Key 是站里掏钱的，这三行就是钱包的闸门
+  OCR_PER_HOUR: '30'
+  OCR_PER_DAY: '200'
+  OCR_GLOBAL_PER_DAY: '3000'
+  OCR_MAX_IMAGE_BYTES: '8388608'
+  PORT: '7994'

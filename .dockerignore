@@ -1,0 +1,14 @@
+.git
+.gitignore
+.github
+node_modules
+preview
+tests
+tools
+.woodpecker.yml
+Makefile
+Dockerfile
+k8s.yaml
+.dockerignore
+*.log
+.DS_Store

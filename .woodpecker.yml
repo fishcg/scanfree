@@ -1,0 +1,59 @@
+# 全民扫描 —— 自动构建与上线（Woodpecker CI）
+#
+# 照着 ai-image 的流水线做的，只多了一步：**先跑测试再构建**。
+# 顺序是：push → 跑单元测试 → 构建镜像推到集群内网 registry → 滚动更新 k8s Deployment。
+#
+# 三个注意点（都是 ai-image 那边踩出来的）：
+#   1. clone 必须关掉 partial clone：国内网络下部分克隆极容易断流；
+#   2. 构建要走 7899 的代理，但 no_proxy 里必须放行内网 registry 和集群网段，
+#      否则 docker 拉基础镜像会去绕代理，反而连不上；
+#   3. 镜像 tag 用提交短 SHA，回滚就是 kubectl set image 到上一个 SHA。
+clone:
+  git:
+    image: 172.24.173.77:30500/woodpecker-git:latest
+    settings:
+      partial: false
+      depth: 1
+      tags: true
+    environment:
+      - https_proxy=http://172.24.173.76:7899
+      - http_proxy=http://172.24.173.76:7899
+      - no_proxy=localhost,127.0.0.1,10.42.0.0/16,10.43.0.0/16,172.24.173.77
+
+steps:
+  # 测试不过就不构建：一个把坏版本推上生产的流水线，比没有流水线更糟
+  test:
+    image: 172.24.173.77:30500/node:24.13.0-alpine
+    commands:
+      # 服务端零依赖，所以这里既不用 npm install，也不用联网。
+      # 不含 e2e.test.mjs：那个要真浏览器，交给本地跑（CI 里没有 Chromium）
+      - node --test tests/filters.test.mjs tests/zip.test.mjs tests/pdf.test.mjs tests/textpdf.test.mjs tests/detect.test.mjs tests/ai.test.mjs tests/server.test.mjs tests/sw.test.mjs
+    when:
+      event: [push, tag, pull_request]
+
+  build-and-push:
+    image: 172.24.173.77:30500/standard-docker:latest
+    privileged: true
+    settings:
+      registry: http://172.24.173.77:30500
+      repo: 172.24.173.77:30500/scanfree
+      tags:
+        - latest
+        - ${CI_COMMIT_SHA:0:7}
+      insecure: true
+      build_args:
+        - http_proxy=http://172.24.173.76:7899
+        - https_proxy=http://172.24.173.76:7899
+        - no_proxy=localhost,127.0.0.1,172.24.173.77,10.42.0.0/16,10.43.0.0/16
+    when:
+      event: [push, tag]
+
+  update-k8s-deployment:
+    image: 172.24.173.77:30500/bitnami-kubectl:latest
+    environment:
+      KUBECONFIG: /woodpecker/kubeconfig
+    commands:
+      - kubectl set image deployment/scanfree scanfree=172.24.173.77:30500/scanfree:${CI_COMMIT_SHA:0:7} --namespace=default
+      - kubectl rollout status deployment/scanfree --namespace=default --timeout=120s
+    when:
+      event: [push, tag]

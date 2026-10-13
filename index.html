@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no"
+    />
+    <meta name="theme-color" content="#0f766e" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="全民扫描" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta
+      name="description"
+      content="全民扫描 —— 免费、无广告、不上传的扫描 App。拍照去阴影、自动裁边、转 PDF、提取文字，全部在你自己的设备上完成。"
+    />
+    <title>全民扫描 · 免费扫描 App</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="assets/icon-180.png" />
+    <link rel="stylesheet" href="css/app.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <header id="topbar" class="topbar"></header>
+      <main id="view" class="view" tabindex="-1"></main>
+      <div id="camera" class="camera" hidden></div>
+      <input
+        id="file-input"
+        class="hidden-input"
+        type="file"
+        accept="image/*"
+        multiple
+        aria-hidden="true"
+      />
+    </div>
+
+    <noscript>
+      <div class="noscript">本应用需要启用 JavaScript 才能运行。</div>
+    </noscript>
+
+    <script type="module" src="js/app.js"></script>
+    <script>
+      // 注册离线缓存（Service Worker 只在 http(s) 下可用，file:// 打开时自动跳过）
+      if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('sw.js').catch(() => {});
+        });
+      }
+    </script>
+  </body>
+</html>

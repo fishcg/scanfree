@@ -1,0 +1,27 @@
+{
+  "name": "scanfree",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "全民扫描 —— 免登录、免收费的网页扫描 App：拍照 → 自动裁边 → 去阴影增强 → 多页管理 → PDF/JPG/TXT/文字版 PDF 导出 → 文字识别（本地离线 或 服务端在线 AI）",
+  "keywords": [
+    "scanner",
+    "ocr",
+    "pdf",
+    "pwa",
+    "camscanner-alternative"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test tests/*.test.mjs",
+    "test:unit": "node --test tests/filters.test.mjs tests/zip.test.mjs tests/pdf.test.mjs tests/textpdf.test.mjs tests/detect.test.mjs tests/ai.test.mjs tests/server.test.mjs tests/sw.test.mjs",
+    "test:e2e": "node --test tests/e2e.test.mjs",
+    "icons": "node tools/make-icons.mjs",
+    "preview": "node tools/preview.mjs",
+    "check": "node tools/check-imports.mjs"
+  }
+}

@@ -1,0 +1,10 @@
+# 开发过程的产物，不进仓库
+preview/
+node_modules/
+*.log
+.DS_Store
+
+# 本地跑的密钥（哪怕只在自己机器上，也别让它在 git 里出现一次）
+.env
+.env.local
+config.local.js
